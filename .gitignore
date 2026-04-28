@@ -49,3 +49,6 @@ CMakeFiles/*
 # Ai helperfilers
 **/[cC]laude.[mM][dD]
 **/CLAUDE.[mM][dD]
+
+# self-built release artifacts (binaries, .deb, tarballs)
+/release

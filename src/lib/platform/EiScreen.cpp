@@ -58,11 +58,19 @@ EiScreen::EiScreen(bool isPrimary, IEventQueue *events, bool usePortal)
     });
     if (isPrimary) {
       m_portalInputCapture = new PortalInputCapture(this, m_events);
+      // GNOME InputCapture has no clipboard support — create a separate
+      // RemoteDesktop session just for org.freedesktop.portal.Clipboard.
+      m_portalClipboard = new PortalRemoteDesktop(this, m_events, /*clipboardOnly=*/true);
     } else {
       m_events->addHandler(EventTypes::EISessionClosed, getEventTarget(), [this](const auto &) {
         handlePortalSessionClosed();
       });
       m_portalRemoteDesktop = new PortalRemoteDesktop(this, m_events);
+      // Use the same RemoteDesktop session for clipboard. Our PortalRemoteDesktop
+      // already calls RequestClipboard on the session before Start(), so the
+      // session has clipboard capability. No need for a separate clipboard-only
+      // session (which would trigger a second GNOME permission dialog).
+      m_portalClipboard = m_portalRemoteDesktop;
     }
   } else {
     // Note: socket backend does not support reconnections
@@ -89,6 +97,9 @@ EiScreen::~EiScreen()
   delete m_keyState;
   delete m_clipboard;
 
+  // Avoid double-free: on non-primary, m_portalClipboard == m_portalRemoteDesktop
+  if (m_portalClipboard != m_portalRemoteDesktop)
+    delete m_portalClipboard;
   delete m_portalRemoteDesktop;
 }
 
@@ -165,6 +176,13 @@ void *EiScreen::getEventTarget() const
 
 bool EiScreen::getClipboard(ClipboardID id, IClipboard *clipboard) const
 {
+  // Prefer portal clipboard (no focus-grabbing on GNOME/Wayland).
+  // Both primary and non-primary use m_portalClipboard for clipboard operations.
+  if (m_portalClipboard && m_portalClipboard->hasClipboardSupport()) {
+    return m_portalClipboard->getClipboard(id, clipboard);
+  }
+
+  // Fallback: WlClipboard (spawns wl-copy/wl-paste, may grab focus on GNOME)
   if (!m_clipboard || !m_clipboard->isAvailable()) {
     return false;
   }
@@ -339,8 +357,12 @@ void EiScreen::fakeKey(uint32_t keycode, bool isDown) const
 
 void EiScreen::enable()
 {
-  // Nothing really to be done here
-  if (m_clipboard && m_clipboard->isAvailable()) {
+  // Only start WlClipboard monitoring if Portal clipboard is NOT active.
+  // WlClipboard spawns wl-copy/wl-paste which steal keyboard focus on GNOME.
+  const bool portalActive = m_portalClipboard && m_portalClipboard->hasClipboardSupport();
+
+  if (!portalActive && m_clipboard && m_clipboard->isAvailable()) {
+    LOG_WARN("using WlClipboard for clipboard — this may cause focus-grabbing on GNOME/Wayland");
     m_clipboard->startMonitoring();
   }
 }
@@ -397,7 +419,18 @@ void EiScreen::leave()
 
 bool EiScreen::setClipboard(ClipboardID id, const IClipboard *clipboard)
 {
-  if (!clipboard || !m_clipboard || !m_clipboard->isAvailable()) {
+  if (!clipboard) {
+    return false;
+  }
+
+  // Prefer portal clipboard (no focus-grabbing on GNOME/Wayland).
+  // Both primary and non-primary use m_portalClipboard for clipboard operations.
+  if (m_portalClipboard && m_portalClipboard->hasClipboardSupport()) {
+    return m_portalClipboard->setClipboard(id, clipboard);
+  }
+
+  // Fallback: WlClipboard (spawns wl-copy/wl-paste, may grab focus on GNOME)
+  if (!m_clipboard || !m_clipboard->isAvailable()) {
     return false;
   }
 
@@ -411,7 +444,14 @@ bool EiScreen::setClipboard(ClipboardID id, const IClipboard *clipboard)
 
 void EiScreen::checkClipboards()
 {
-  // do nothing, we're always up to date
+  // Portal clipboard uses SelectionOwnerChanged signal — no polling needed.
+  const bool portalActive = m_portalClipboard && m_portalClipboard->hasClipboardSupport();
+
+  if (portalActive) {
+    return;
+  }
+
+  // WlClipboard fallback: poll for changes
   if (!m_clipboard || !m_clipboard->isAvailable()) {
     return;
   }

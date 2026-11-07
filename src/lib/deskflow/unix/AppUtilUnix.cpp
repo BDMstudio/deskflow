@@ -9,14 +9,19 @@
 
 #include "base/Log.h"
 
-#if WINAPI_XWINDOWS
+// X11LayoutsParser is needed both for X11 layout detection AND for
+// converting XKB layout names to ISO codes in the GSettings fallback.
 #include "deskflow/unix/X11LayoutsParser.h"
+
+#if WINAPI_XWINDOWS
 #include <X11/XKBlib.h>
 #elif defined(Q_OS_MAC)
 #include <Carbon/Carbon.h>
 #include <platform/OSXAutoTypes.h>
 #endif
 
+#include <array>
+#include <cstdio>
 #include <filesystem>
 
 AppUtilUnix::AppUtilUnix(const IEventQueue *)
@@ -79,6 +84,75 @@ std::vector<std::string> AppUtilUnix::getKeyboardLayoutList()
     }
   }
 #endif
+
+  // Wayland fallback: X11 path may fail if no X server is available.
+  // Try reading GNOME keyboard layout from GSettings/dconf.
+  if (layoutLangCodes.empty()) {
+    layoutLangCodes = getKeyboardLayoutListFromGSettings();
+  }
+
+  return layoutLangCodes;
+}
+
+std::vector<std::string> AppUtilUnix::getKeyboardLayoutListFromGSettings()
+{
+  std::vector<std::string> layoutLangCodes;
+
+  // Try gsettings first, then fall back to dconf
+  const char *commands[] = {
+      "gsettings get org.gnome.desktop.input-sources sources 2>/dev/null",
+      "dconf read /org/gnome/desktop/input-sources/sources 2>/dev/null",
+  };
+
+  std::string output;
+  for (const auto *cmd : commands) {
+    std::array<char, 256> buffer;
+    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
+    if (!pipe)
+      continue;
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+      output += buffer.data();
+    }
+    if (!output.empty())
+      break;
+  }
+
+  if (output.empty()) {
+    LOG_DEBUG("gsettings/dconf: no output, skipping GSettings layout detection");
+    return layoutLangCodes;
+  }
+
+  // Parse Gnome-style input source list: [('xkb', 'cn'), ('ibus', 'libpinyin')]
+  // or dconf-style: [('xkb', 'cn')]
+  std::string xkbLayout;
+  size_t pos = 0;
+  while ((pos = output.find("'xkb'", pos)) != std::string::npos) {
+    // Find the layout name after 'xkb'
+    size_t layoutStart = output.find("'", pos + 5);
+    if (layoutStart == std::string::npos)
+      break;
+    size_t layoutEnd = output.find("'", layoutStart + 1);
+    if (layoutEnd == std::string::npos)
+      break;
+    xkbLayout = output.substr(layoutStart + 1, layoutEnd - layoutStart - 1);
+    pos = layoutEnd;
+
+    if (!xkbLayout.empty()) {
+      // Convert XKB layout name to ISO 639-1 via evdev.xml
+      std::string evdevPath = "/usr/share/X11/xkb/rules/evdev.xml";
+      if (!std::filesystem::exists(evdevPath))
+        evdevPath = "/usr/local/share/X11/xkb/rules/evdev.xml";
+
+      std::string isoCode = X11LayoutsParser::convertLayoutToISO(evdevPath, xkbLayout, false);
+      if (!isoCode.empty() &&
+          std::find(layoutLangCodes.begin(), layoutLangCodes.end(), isoCode) == layoutLangCodes.end()) {
+        layoutLangCodes.push_back(isoCode);
+        LOG_INFO("gsettings: detected layout '%s' -> ISO code '%s'", xkbLayout.c_str(), isoCode.c_str());
+      } else if (isoCode.empty()) {
+        LOG_WARN("gsettings: layout '%s' not found in evdev.xml", xkbLayout.c_str());
+      }
+    }
+  }
 
   return layoutLangCodes;
 }

@@ -214,15 +214,21 @@ void PortalRemoteDesktop::handleInitSession(GObject *object, GAsyncResult *res)
 
 gboolean PortalRemoteDesktop::initSession()
 {
-  if (auto sessionToken = Settings::value(Settings::Client::XdpRestoreToken).toByteArray(); !sessionToken.isEmpty()) {
-    free(m_sessionRestoreToken);
-    m_sessionRestoreToken = strdup(sessionToken.data());
-  }
+  // WORKAROUND: Do not use restore tokens. The GNOME portal backend restores
+  // session state from persisted data that was saved BEFORE RequestClipboard
+  // was called, so clipboard_enabled=FALSE in the restored state. This causes
+  // the clipboard permission option to be missing on autostart. Using
+  // TRANSIENT mode avoids stale restore data while still allowing the
+  // session to persist for the current compositor run.
+  // TODO: Revert to PERSIST_MODE_PERSISTENT once xdg-desktop-portal-gnome
+  // fixes restore data serialization to include clipboard_enabled=TRUE.
+  free(m_sessionRestoreToken);
+  m_sessionRestoreToken = nullptr;
 
-  LOG_DEBUG("setting up remote desktop session with restore token %s", m_sessionRestoreToken);
+  LOG_DEBUG("setting up remote desktop session (transient, no restore token)");
   xdp_portal_create_remote_desktop_session_full(
       m_portal, static_cast<XdpDeviceType>(XDP_DEVICE_POINTER | XDP_DEVICE_KEYBOARD), XDP_OUTPUT_NONE,
-      XDP_REMOTE_DESKTOP_FLAG_NONE, XDP_CURSOR_MODE_HIDDEN, XDP_PERSIST_MODE_PERSISTENT, m_sessionRestoreToken,
+      XDP_REMOTE_DESKTOP_FLAG_NONE, XDP_CURSOR_MODE_HIDDEN, XDP_PERSIST_MODE_TRANSIENT, m_sessionRestoreToken,
       nullptr, // cancellable
       [](GObject *obj, GAsyncResult *res, gpointer data) {
         static_cast<PortalRemoteDesktop *>(data)->handleInitSession(obj, res);
@@ -461,8 +467,8 @@ void PortalRemoteDesktop::onSelectionOwnerChanged(
       mimeList += ", ";
     mimeList += mt;
   }
-  LOG_DEBUG("clipboard: SelectionOwnerChanged with %zu mime types [%s], session_is_owner=%d", mimeTypes.size(),
-            mimeList.c_str(), sessionIsOwner);
+  LOG_INFO("clipboard: SelectionOwnerChanged with %zu mime types [%s], session_is_owner=%d", mimeTypes.size(),
+           mimeList.c_str(), sessionIsOwner);
 
   // If we own the clipboard (we just set it via SetSelection), ignore.
   {
@@ -472,7 +478,7 @@ void PortalRemoteDesktop::onSelectionOwnerChanged(
       if (!mimeTypes.empty()) {
         m_weOwnClipboard = false;
       }
-      LOG_DEBUG("clipboard: ignoring SelectionOwnerChanged (we are the owner)");
+      LOG_INFO("clipboard: ignoring SelectionOwnerChanged (we are the owner)");
       return;
     }
   }
@@ -733,9 +739,13 @@ bool PortalRemoteDesktop::setClipboard(ClipboardID id, const IClipboard *clipboa
     }
   }
 
-  // Build the list of offered MIME types for SetSelection
+  // Build the list of offered MIME types for SetSelection.
+  // If the clipboard only contains unsupported formats, the portal rejects an
+  // empty mime_types array, so skip the call and leave the existing selection in
+  // place.
   GVariantBuilder mimeBuilder;
   g_variant_builder_init(&mimeBuilder, G_VARIANT_TYPE("as"));
+  size_t mimeCount = 0;
   {
     std::lock_guard<std::mutex> lock(m_clipboardMutex);
     m_storedClipboard.open(0);
@@ -743,10 +753,16 @@ bool PortalRemoteDesktop::setClipboard(ClipboardID id, const IClipboard *clipboa
       if (m_storedClipboard.has(mapping.format)) {
         for (const auto &mime : mapping.mimeTypes) {
           g_variant_builder_add(&mimeBuilder, "s", mime.c_str());
+          ++mimeCount;
         }
       }
     }
     m_storedClipboard.close();
+  }
+
+  if (mimeCount == 0) {
+    LOG_NOTE("clipboard: skipping SetSelection because no supported MIME types were found");
+    return false;
   }
 
   // Build options dict with mime_types

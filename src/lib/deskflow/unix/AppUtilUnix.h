@@ -9,6 +9,9 @@
 
 #include "deskflow/AppUtil.h"
 
+#include <string>
+#include <vector>
+
 #define ARCH_APP_UTIL AppUtilUnix
 
 class IEventQueue;
@@ -24,4 +27,7 @@ public:
   std::vector<std::string> getKeyboardLayoutList() override;
   std::string getCurrentLanguageCode() override;
   std::string m_evdev;
+
+private:
+  std::vector<std::string> getKeyboardLayoutListFromGSettings();
 };

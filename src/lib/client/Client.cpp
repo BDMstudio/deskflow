@@ -325,6 +325,11 @@ void Client::sendClipboard(ClipboardID id)
   assert(m_screen != nullptr);
   assert(m_server != nullptr);
 
+  LOG_INFO(
+      "clipboard: sendClipboard start id=%d active=%d own=%d sent=%d prevTime=%u", id, m_active,
+      m_ownClipboard[id], m_sentClipboard[id], (unsigned)m_timeClipboard[id]
+  );
+
   // get clipboard data.  set the clipboard time to the last
   // clipboard time before getting the data from the screen
   // as the screen may detect an unchanged clipboard and
@@ -339,6 +344,10 @@ void Client::sendClipboard(ClipboardID id)
   if (m_timeClipboard[id] == 0 || clipboard.getTime() != m_timeClipboard[id]) {
     // marshall the data
     std::string data = clipboard.marshall();
+    LOG_INFO(
+        "clipboard: sendClipboard candidate id=%d time=%u dataBytes=%zu prevTime=%u sent=%d", id,
+        (unsigned)clipboard.getTime(), data.size(), (unsigned)m_timeClipboard[id], m_sentClipboard[id]
+    );
     if (data.size() >= m_maximumClipboardSize * 1024) {
       LOG(
           (CLOG_NOTE "skipping clipboard transfer because the clipboard"
@@ -354,8 +363,16 @@ void Client::sendClipboard(ClipboardID id)
     if (!m_sentClipboard[id] || data != m_dataClipboard[id]) {
       m_sentClipboard[id] = true;
       m_dataClipboard[id] = data;
+      LOG_INFO("clipboard: sendClipboard forwarding id=%d bytes=%zu", id, data.size());
       m_server->onClipboardChanged(id, &clipboard);
+    } else {
+      LOG_INFO("clipboard: sendClipboard suppressed duplicate id=%d bytes=%zu", id, data.size());
     }
+  } else {
+    LOG_INFO(
+        "clipboard: sendClipboard unchanged id=%d time=%u prevTime=%u", id, (unsigned)clipboard.getTime(),
+        (unsigned)m_timeClipboard[id]
+    );
   }
 }
 
@@ -559,6 +576,11 @@ void Client::handleClipboardGrabbed(const Event &event)
 
   const auto *info = static_cast<const IScreen::ClipboardInfo *>(event.getData());
 
+  LOG_INFO(
+      "clipboard: handleClipboardGrabbed id=%d active=%d seq=%u", info->m_id, m_active,
+      (unsigned)info->m_sequenceNumber
+  );
+
   // grab ownership
   m_server->onGrabClipboard(info->m_id);
 
@@ -567,11 +589,9 @@ void Client::handleClipboardGrabbed(const Event &event)
   m_sentClipboard[info->m_id] = false;
   m_timeClipboard[info->m_id] = 0;
 
-  // if we're not the active screen then send the clipboard now,
-  // otherwise we'll wait until we leave.
-  if (!m_active) {
-    sendClipboard(info->m_id);
-  }
+  // Send clipboard changes immediately so consecutive copies on the same
+  // screen propagate separately. leave() still acts as a fallback flush.
+  sendClipboard(info->m_id);
 }
 
 void Client::handleHello()

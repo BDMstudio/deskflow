@@ -66,10 +66,11 @@ EiScreen::EiScreen(bool isPrimary, IEventQueue *events, bool usePortal)
         handlePortalSessionClosed();
       });
       m_portalRemoteDesktop = new PortalRemoteDesktop(this, m_events);
-      // Client-side RemoteDesktop session (created via libportal) does NOT have
-      // the CLIPBOARD capability (libportal 0.9.1 doesn't expose it). Create a
-      // separate clipboard-only session for org.freedesktop.portal.Clipboard.
-      m_portalClipboard = new PortalRemoteDesktop(this, m_events, /*clipboardOnly=*/true);
+      // Use the same RemoteDesktop session for clipboard. Our PortalRemoteDesktop
+      // already calls RequestClipboard on the session before Start(), so the
+      // session has clipboard capability. No need for a separate clipboard-only
+      // session (which would trigger a second GNOME permission dialog).
+      m_portalClipboard = m_portalRemoteDesktop;
     }
   } else {
     // Note: socket backend does not support reconnections
@@ -96,7 +97,9 @@ EiScreen::~EiScreen()
   delete m_keyState;
   delete m_clipboard;
 
-  delete m_portalClipboard;
+  // Avoid double-free: on non-primary, m_portalClipboard == m_portalRemoteDesktop
+  if (m_portalClipboard != m_portalRemoteDesktop)
+    delete m_portalClipboard;
   delete m_portalRemoteDesktop;
 }
 
